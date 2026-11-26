@@ -1,0 +1,2 @@
+model__subsample,model__n_estimators,model__min_samples_split,model__min_samples_leaf,model__max_features,model__max_depth,model__loss,model__learning_rate
+0.75,500,2,2,,4,huber,0.1

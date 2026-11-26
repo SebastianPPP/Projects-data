@@ -1,0 +1,5 @@
+Model,Best_Params
+1. Logistic Regression,"{'clf__class_weight': 'balanced', 'clf__C': np.float64(41.753189365604044)}"
+2. KNN (Tuned),"{'clf__weights': 'distance', 'clf__p': 3, 'clf__n_neighbors': 3, 'clf__metric': 'manhattan'}"
+3. SVM (RBF Kernel),"{'clf__gamma': 'auto', 'clf__class_weight': 'balanced', 'clf__C': np.float64(22.12216291070448)}"
+4. Random Forest,"{'n_estimators': 400, 'min_samples_split': 3, 'min_samples_leaf': 1, 'max_features': 'log2', 'max_depth': 8, 'class_weight': None}"
