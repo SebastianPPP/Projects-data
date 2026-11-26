@@ -7,6 +7,10 @@ Describe and justify you approach in a short report; include the plot, do not in
 
 System accepts only reports in PDF files!
 
+Notes:
+First step was to see how data work and what variables i should be worried about. I shown the figures of pure data vs dependent. It shows that the samples were obtained about every second, therefore i decided to use candle visualization afterwards. 
+
+
 
 ## Project 2: classification & validation
 In this assignment you will build and validate the classification model.

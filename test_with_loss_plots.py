@@ -10,7 +10,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, RandomizedSearchCV
+from sklearn.model_selection import KFold, RandomizedSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, SplineTransformer, StandardScaler
 from tqdm import tqdm
@@ -54,10 +54,10 @@ df = pd.read_csv('data.csv')
 sns.set_theme(style='whitegrid', context='notebook')
 palette = {'group1': '#1f77b4', 'group2': '#ff7f0e'}
 
-fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.5), dpi=100)
-plt.subplots_adjust(hspace=0.38, wspace=0.28)
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4), dpi=100)
+plt.subplots_adjust(wspace=0.28)
 
-ax = axes[0, 0]
+ax = axes[0]
 np.random.seed(42)
 for grp, sub in df.groupby('group'):
     jitter = np.random.uniform(-0.12, 0.12, size=len(sub))
@@ -79,13 +79,13 @@ for grp, sub in df.groupby('group'):
         markersize=4,
         label=f'{grp} mean',
     )
-ax.set_title('1. Dependent vs. Time', fontsize=10, fontweight='bold')
-ax.set_xlabel('time', fontsize=9)
-ax.set_ylabel('dependent', fontsize=9)
+ax.set_title('1. Dependent vs. Time', fontsize=10.5, fontweight='bold')
+ax.set_xlabel('time', fontsize=9.5)
+ax.set_ylabel('dependent', fontsize=9.5)
 ax.set_xticks(range(1, 11))
-ax.legend(fontsize=7.5, loc='upper left')
+ax.legend(fontsize=8, loc='upper left')
 
-ax = axes[0, 1]
+ax = axes[1]
 corr_g1 = df[df['group'] == 'group1'].drop(columns=['group']).corr()['dependent'].drop('dependent')
 corr_g2 = df[df['group'] == 'group2'].drop(columns=['group']).corr()['dependent'].drop('dependent')
 corr_df = pd.DataFrame({'group1': corr_g1, 'group2': corr_g2})
@@ -100,21 +100,28 @@ sns.heatmap(
     cbar_kws={'label': 'Pearson r'},
     ax=ax,
     linewidths=1,
-    annot_kws={'size': 8.5},
+    annot_kws={'size': 9},
 )
-ax.set_title('2. Pearson Correlation by Group', fontsize=10, fontweight='bold')
-ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8.5)
+ax.set_title('2. Pearson Correlation by Group', fontsize=10.5, fontweight='bold')
+ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=9)
+
+fig.suptitle('Time Dynamics & Group Correlations (n = 400)', fontsize=12, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'eda_time_corr.png'), dpi=150, bbox_inches='tight')
+plt.show()
 
 vars_to_plot = ['var1', 'var2', 'var3', 'var4']
-feature_axes = [axes[0, 2], axes[1, 0], axes[1, 1], axes[1, 2]]
 titles = [
-    '3. Dependent vs. var1',
-    '4. Dependent vs. var2',
-    '5. Dependent vs. var3',
-    '6. Dependent vs. var4',
+    '1. Dependent vs. var1',
+    '2. Dependent vs. var2',
+    '3. Dependent vs. var3',
+    '4. Dependent vs. var4',
 ]
 
-for ax, var, title in zip(feature_axes, vars_to_plot, titles):
+fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.6), dpi=100)
+plt.subplots_adjust(hspace=0.35, wspace=0.25)
+
+for ax, var, title in zip(axes.flat, vars_to_plot, titles):
     for grp, sub in df.groupby('group'):
         ax.scatter(sub[var], sub['dependent'], alpha=0.45, s=18, color=palette[grp], label=grp)
         m, b = np.polyfit(sub[var], sub['dependent'], 1)
@@ -125,9 +132,9 @@ for ax, var, title in zip(feature_axes, vars_to_plot, titles):
     ax.set_ylabel('dependent', fontsize=9)
     ax.legend(fontsize=8)
 
-fig.suptitle('Exploratory Data Analysis: Group Regimes & Predictors (n = 400)', fontsize=12, fontweight='bold')
+fig.suptitle('Exploratory Data Analysis: Predictors vs. Dependent (n = 400)', fontsize=12, fontweight='bold')
 plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'eda_overview.png'), dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(output_dir, 'eda_predictors.png'), dpi=150, bbox_inches='tight')
 plt.show()
 
 df_res = df.copy()
@@ -285,25 +292,34 @@ models = {
     '5. Gradient Boosting (Tuned)': gb_tuned,
 }
 
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
+# outer validation: 5-fold CV stratified by group x time (each fold keeps both groups and all time points)
+strat_labels = (df['group'].astype(str) + '_' + df['time'].astype(str)).values
+kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 results = []
 oof_preds = {name: np.zeros_like(y, dtype=float) for name in models}
 
 total_cv_steps = len(models) * 5 + 1
 pbar_cv = tqdm(total=total_cv_steps, desc='Project 1: Model CV & GB Tuning', unit='step')
 
+train_rmse_folds = {}
+val_rmse_folds = {}
+
 for name, estimator in models.items():
-    fold_r2, fold_rmse, fold_mae = [], [], []
-    for fold_i, (train_idx, val_idx) in enumerate(kf.split(X, y), start=1):
+    fold_r2, fold_rmse, fold_mae, fold_train_rmse = [], [], [], []
+    for fold_i, (train_idx, val_idx) in enumerate(kf.split(X, strat_labels), start=1):
         pbar_cv.set_postfix_str(f'{name} | fold {fold_i}/5')
         model_fold = clone(estimator)
         model_fold.fit(X.iloc[train_idx], y[train_idx])
         preds = model_fold.predict(X.iloc[val_idx])
+        train_preds = model_fold.predict(X.iloc[train_idx])
         oof_preds[name][val_idx] = preds
         fold_r2.append(r2_score(y[val_idx], preds))
         fold_rmse.append(np.sqrt(mean_squared_error(y[val_idx], preds)))
         fold_mae.append(mean_absolute_error(y[val_idx], preds))
+        fold_train_rmse.append(np.sqrt(mean_squared_error(y[train_idx], train_preds)))
         pbar_cv.update(1)
+    train_rmse_folds[name] = fold_train_rmse
+    val_rmse_folds[name] = fold_rmse
     results.append({
         'Model': name,
         'R2_mean': np.mean(fold_r2),
@@ -311,6 +327,7 @@ for name, estimator in models.items():
         'RMSE_mean': np.mean(fold_rmse),
         'RMSE_std': np.std(fold_rmse),
         'MAE_mean': np.mean(fold_mae),
+        'Train_RMSE_mean': np.mean(fold_train_rmse),
     })
 
 pbar_cv.set_postfix_str('Full GB Hyperparameter Search')
@@ -350,13 +367,94 @@ plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'model_comparison.png'), dpi=150, bbox_inches='tight')
 plt.show()
 
+# ---------- A) Train vs. test (validation) RMSE for every model ----------
+names = list(models.keys())
+tr_mean = [np.mean(train_rmse_folds[n]) for n in names]
+tr_std = [np.std(train_rmse_folds[n]) for n in names]
+va_mean = [np.mean(val_rmse_folds[n]) for n in names]
+va_std = [np.std(val_rmse_folds[n]) for n in names]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.8), dpi=100, gridspec_kw={'width_ratios': [1.3, 1]})
+
+ax = axes[0]
+x_pos = np.arange(len(names))
+w = 0.36
+ax.bar(x_pos - w / 2, tr_mean, w, yerr=tr_std, capsize=3, color='#4c72b0', alpha=0.85, label='Train RMSE')
+ax.bar(x_pos + w / 2, va_mean, w, yerr=va_std, capsize=3, color='#dd8452', alpha=0.85, label='Test (val) RMSE')
+ax.set_xticks(x_pos)
+ax.set_xticklabels([n.replace(' (', '\n(') for n in names], fontsize=8)
+ax.set_ylabel('RMSE')
+ax.set_title('Train vs. Test RMSE (mean ± std over 5 folds)', fontsize=10.5, fontweight='bold')
+ax.legend()
+
+ax = axes[1]
+for n, c in zip(names, sns.color_palette('tab10', len(names))):
+    ax.plot(range(1, 6), train_rmse_folds[n], '--o', color=c, alpha=0.6, markersize=4)
+    ax.plot(range(1, 6), val_rmse_folds[n], '-o', color=c, label=n, markersize=4)
+ax.set_xticks(range(1, 6))
+ax.set_xlabel('CV fold')
+ax.set_ylabel('RMSE')
+ax.set_title('Per-fold RMSE (dashed = train, solid = test)', fontsize=10.5, fontweight='bold')
+ax.legend(fontsize=7)
+
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'train_test_rmse.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+
+# ---------- B) Loss curves vs. boosting iteration (Gradient Boosting) ----------
+def gb_loss_curves(pipe_template, X, y, kf):
+    """Train/test RMSE after every boosting stage, for each CV fold."""
+    tr_curves, te_curves = [], []
+    for tr_idx, te_idx in kf.split(X, strat_labels):
+        pipe = clone(pipe_template).fit(X.iloc[tr_idx], y[tr_idx])
+        prep_step, gb = pipe.named_steps['prep'], pipe.named_steps['model']
+        Xtr = prep_step.transform(X.iloc[tr_idx])
+        Xte = prep_step.transform(X.iloc[te_idx])
+        tr_curves.append([np.sqrt(mean_squared_error(y[tr_idx], p)) for p in gb.staged_predict(Xtr)])
+        te_curves.append([np.sqrt(mean_squared_error(y[te_idx], p)) for p in gb.staged_predict(Xte)])
+    return np.array(tr_curves), np.array(te_curves)
+
+
+# tuned pipeline = best hyperparameters found by the search (unfitted copy)
+gb_tuned_pipe = clone(best_gb_search.best_estimator_)
+
+gb_variants = {
+    '4. Gradient Boosting (Default)': gb_default_pipe,
+    '5. Gradient Boosting (Tuned)': gb_tuned_pipe,
+}
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.4), dpi=100, sharey=True)
+for ax, (name, pipe) in zip(axes, gb_variants.items()):
+    tr, te = gb_loss_curves(pipe, X, y, kf)
+    it = np.arange(1, tr.shape[1] + 1)
+    for curve, color, lab in [(tr, '#4c72b0', 'Train'), (te, '#dd8452', 'Test (val)')]:
+        m, s = curve.mean(0), curve.std(0)
+        ax.plot(it, m, color=color, linewidth=2, label=lab)
+        ax.fill_between(it, m - s, m + s, color=color, alpha=0.2)
+    best_it = te.mean(0).argmin() + 1
+    ax.axvline(best_it, color='gray', linestyle=':', label=f'min test RMSE @ {best_it}')
+    ax.set_title(name, fontsize=10.5, fontweight='bold')
+    ax.set_xlabel('Boosting iteration')
+    ax.legend(fontsize=8)
+axes[0].set_ylabel('RMSE (loss)')
+
+fig.suptitle('Gradient Boosting: Train vs. Test Loss Curves (mean ± std, 5 folds)', fontsize=11.5, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'gb_loss_curves.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+fitted_models = {}
+for name, estimator in tqdm(models.items(), desc='Project 1: Fitting Full Models', unit='model'):
+    if name == '5. Gradient Boosting (Tuned)':
+        fitted_models[name] = best_gb_search.best_estimator_
+    else:
+        fitted_models[name] = clone(estimator).fit(X, y)
+
 fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.2), dpi=100)
 plt.subplots_adjust(hspace=0.38, wspace=0.25)
 
-for ax, (name, estimator) in zip(axes.flat, tqdm(models.items(), desc='Project 1: Trajectory Plots', unit='plot')):
-    fitted_model = clone(estimator).fit(X, y)
-    if hasattr(fitted_model, 'best_estimator_'):
-        fitted_model = fitted_model.best_estimator_
+for ax, (name, fitted_model) in zip(axes.flat, fitted_models.items()):
     for grp in ['group1', 'group2']:
         sub = df[df['group'] == grp]
         ax.scatter(sub['time'], sub['dependent'], alpha=0.35, s=16, color=palette[grp])
@@ -380,4 +478,71 @@ axes.flat[-1].axis('off')
 fig.suptitle('Fitted Group Trajectories vs. Time (at Group Predictor Means)', fontsize=11.5, fontweight='bold')
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'model_group_lines.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.5), dpi=100)
+plt.subplots_adjust(hspace=0.38, wspace=0.25)
+
+for ax, (name, fitted_model) in zip(axes.flat, fitted_models.items()):
+    for grp in ['group1', 'group2']:
+        sub = df[df['group'] == grp]
+        offset = -0.15 if grp == 'group1' else 0.15
+        positions = np.arange(1, 11) + offset
+        box_data = [sub[sub['time'] == t]['dependent'].values for t in range(1, 11)]
+
+        ax.boxplot(
+            box_data,
+            positions=positions,
+            widths=0.24,
+            patch_artist=True,
+            showmeans=True,
+            meanprops=dict(
+                marker='D',
+                markeredgecolor='black',
+                markerfacecolor='white',
+                markersize=4,
+                zorder=5,
+            ),
+            medianprops=dict(color='black', linewidth=1.2),
+            boxprops=dict(
+                facecolor=palette[grp],
+                alpha=0.45,
+                edgecolor=palette[grp],
+                linewidth=1,
+            ),
+            whiskerprops=dict(color=palette[grp], linewidth=1),
+            capprops=dict(color=palette[grp], linewidth=1),
+            flierprops=dict(
+                marker='o',
+                markersize=3,
+                markerfacecolor=palette[grp],
+                markeredgecolor='none',
+                alpha=0.6,
+            ),
+        )
+
+        grid_df = pd.DataFrame({
+            'group': grp,
+            'time': time_grid,
+            'var1': sub['var1'].mean(),
+            'var2': sub['var2'].mean(),
+            'var3': sub['var3'].mean(),
+            'var4': sub['var4'].mean(),
+        })
+        y_line = fitted_model.predict(grid_df)
+        ax.plot(time_grid, y_line, color=palette[grp], linewidth=2.2, label=f'{grp} fit', zorder=4)
+
+    ax.scatter([], [], marker='D', edgecolors='black', facecolors='white', s=22, label='group mean')
+    ax.set_title(name, fontsize=9.2, fontweight='bold')
+    ax.set_xlabel('time', fontsize=8.5)
+    ax.set_ylabel('dependent', fontsize=8.5)
+    ax.set_xticks(range(1, 11))
+    ax.set_xticklabels(range(1, 11))
+    ax.set_xlim(0.4, 10.6)
+    ax.legend(fontsize=7.2, loc='upper left')
+axes.flat[-1].axis('off')
+
+fig.suptitle('Fitted Group Trajectories vs. Time with Per-Second Distributions & Means', fontsize=11.5, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'candlestick_models_comparison.png'), dpi=150, bbox_inches='tight')
 plt.show()

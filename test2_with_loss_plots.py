@@ -16,9 +16,10 @@ from sklearn.metrics import (
     cohen_kappa_score,
     confusion_matrix,
     f1_score,
+    log_loss,
     normalized_mutual_info_score,
 )
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, learning_curve
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -35,6 +36,7 @@ sns.set_theme(style='whitegrid', context='notebook')
 sat = pd.read_csv('satellite_image.csv')
 lbl = pd.read_csv('labels.csv')
 
+
 def build_features(df_in):
     X = df_in[[f'band{i}' for i in range(1, 9)]].copy()
     eps = 1e-8
@@ -43,6 +45,7 @@ def build_features(df_in):
     X['RedEdge_Ratio'] = X['band7'] / (X['band5'] + eps)
     X['Brightness'] = X[[f'band{i}' for i in range(1, 9)]].mean(axis=1)
     return X
+
 
 X_lbl = build_features(lbl)
 y_lbl = lbl['label'].values
@@ -148,15 +151,38 @@ base_models = {
 
 metrics_rows = []
 oof_base = {}
+loss_records = []
+
+
+def safe_logloss(model, X_, y_true):
+    if not hasattr(model, 'predict_proba'):
+        return np.nan
+    return log_loss(y_true, model.predict_proba(X_), labels=model.classes_)
+
+
+def record_fold_loss(stage, name, fold_i, model, train_idx, val_idx):
+    Xtr, ytr = X_lbl.iloc[train_idx], y_lbl[train_idx]
+    Xva, yva = X_lbl.iloc[val_idx], y_lbl[val_idx]
+    loss_records.append({
+        'Stage': stage,
+        'Model': name,
+        'Fold': fold_i,
+        'Train_Error': 1.0 - accuracy_score(ytr, model.predict(Xtr)),
+        'Val_Error': 1.0 - accuracy_score(yva, model.predict(Xva)),
+        'Train_LogLoss': safe_logloss(model, Xtr, ytr),
+        'Val_LogLoss': safe_logloss(model, Xva, yva),
+    })
+
 
 pbar_base = tqdm(total=len(base_models) * 5, desc='Part A: Baseline CV', unit='fold')
 for name, clf in base_models.items():
     y_pred = np.empty_like(y_lbl)
-    for train_idx, val_idx in skf.split(X_lbl, y_lbl):
+    for fold_i, (train_idx, val_idx) in enumerate(skf.split(X_lbl, y_lbl), start=1):
         pbar_base.set_postfix_str(name)
         m_fold = clone(clf)
         m_fold.fit(X_lbl.iloc[train_idx], y_lbl[train_idx])
         y_pred[val_idx] = m_fold.predict(X_lbl.iloc[val_idx])
+        record_fold_loss('Baseline', name, fold_i, m_fold, train_idx, val_idx)
         pbar_base.update(1)
     oof_base[name] = y_pred
     acc = accuracy_score(y_lbl, y_pred)
@@ -218,9 +244,11 @@ nx = sat['x'].nunique()
 ny = sat['y'].nunique()
 sat_sorted = sat.sort_values(by=['y', 'x'], ascending=[False, True]).reset_index(drop=True)
 
+
 def stretch_band(arr, low_pct=2, high_pct=98):
     lo, hi = np.percentile(arr, [low_pct, high_pct])
     return np.clip((arr - lo) / (hi - lo), 0, 1)
+
 
 R = stretch_band(sat_sorted['band4'].values).reshape(ny, nx)
 G = stretch_band(sat_sorted['band3'].values).reshape(ny, nx)
@@ -328,7 +356,7 @@ tuned_models = {
             ('clf', LogisticRegression(max_iter=3000, random_state=42)),
         ]),
         param_distributions={
-            'clf__C': np.logspace(-2, 3, 30),
+            'clf__C': np.logspace(-2, 1.5, 25),
             'clf__class_weight': [None, 'balanced'],
         },
         n_iter=25,
@@ -343,12 +371,12 @@ tuned_models = {
             ('clf', KNeighborsClassifier()),
         ]),
         param_distributions={
-            'clf__n_neighbors': [1, 3, 5, 7, 9, 11, 15],
-            'clf__weights': ['uniform', 'distance'],
+            'clf__n_neighbors': [5, 7, 9, 11, 15, 19],
+            'clf__weights': ['uniform'],
             'clf__metric': ['euclidean', 'manhattan', 'minkowski'],
-            'clf__p': [1, 2, 3],
+            'clf__p': [1, 2],
         },
-        n_iter=30,
+        n_iter=25,
         scoring='f1_macro',
         cv=inner_cv,
         n_jobs=-1,
@@ -360,8 +388,8 @@ tuned_models = {
             ('clf', SVC(kernel='rbf', random_state=42)),
         ]),
         param_distributions={
-            'clf__C': np.logspace(-1, 3, 30),
-            'clf__gamma': ['scale', 'auto', 0.005, 0.01, 0.05, 0.1, 0.2, 0.5],
+            'clf__C': np.logspace(-1, 1.5, 25),
+            'clf__gamma': ['scale', 'auto', 0.005, 0.01, 0.03, 0.05, 0.1],
             'clf__class_weight': [None, 'balanced'],
         },
         n_iter=35,
@@ -373,11 +401,12 @@ tuned_models = {
     '4. Random Forest': RandomizedSearchCV(
         estimator=RandomForestClassifier(random_state=42, n_jobs=-1),
         param_distributions={
-            'n_estimators': [200, 400, 600, 800],
-            'max_depth': [None, 8, 12, 16, 24],
-            'min_samples_split': [2, 3, 5, 8],
-            'min_samples_leaf': [1, 2, 3, 4],
-            'max_features': ['sqrt', 'log2', 0.5, 0.7],
+            'n_estimators': [200, 400, 600],
+            'max_depth': [4, 6, 8, 10],
+            'min_samples_split': [5, 8, 12, 16],
+            'min_samples_leaf': [3, 5, 7, 10],
+            'max_features': ['sqrt', 'log2', 0.3, 0.5],
+            'max_samples': [0.7, 0.85, None],
             'class_weight': [None, 'balanced', 'balanced_subsample'],
         },
         n_iter=40,
@@ -402,6 +431,7 @@ for name, search_clf in tuned_models.items():
         m_fold = clone(search_clf)
         m_fold.fit(X_lbl.iloc[train_idx], y_lbl[train_idx])
         y_pred[val_idx] = m_fold.predict(X_lbl.iloc[val_idx])
+        record_fold_loss('Tuned', name, fold_i, m_fold, train_idx, val_idx)
         pbar_tune.update(1)
     oof_tuned[name] = y_pred
     acc = accuracy_score(y_lbl, y_pred)
@@ -431,6 +461,110 @@ pd.DataFrame(best_params_records).to_csv(os.path.join(output_dir, 'best_hyperpar
 
 print('\n=== SUMMARY TABLE: BASELINE VS. TUNED ===')
 print(summary_df.to_string(index=False))
+
+loss_df = pd.DataFrame(loss_records)
+loss_df.to_csv(os.path.join(output_dir, 'train_val_loss_per_fold.csv'), index=False)
+
+fig_loss, axes_loss = plt.subplots(2, 2, figsize=(13.8, 8.4), dpi=100)
+plt.subplots_adjust(hspace=0.42, wspace=0.18)
+metric_specs = [
+    ('Error', 'Error rate (0-1 loss = 1 - accuracy)'),
+    ('LogLoss', 'Log-loss (cross-entropy, log scale)'),
+]
+for col, stage in enumerate(['Baseline', 'Tuned']):
+    sub_stage = loss_df[loss_df['Stage'] == stage]
+    for row, (metric, ylabel) in enumerate(metric_specs):
+        ax = axes_loss[row, col]
+        agg = sub_stage.groupby('Model', sort=False)[[f'Train_{metric}', f'Val_{metric}']].agg(['mean', 'std'])
+        names_stage = list(agg.index)
+        x_pos = np.arange(len(names_stage))
+        w = 0.36
+        tr_m, tr_s = agg[(f'Train_{metric}', 'mean')].values, agg[(f'Train_{metric}', 'std')].values
+        va_m, va_s = agg[(f'Val_{metric}', 'mean')].values, agg[(f'Val_{metric}', 'std')].values
+        ax.bar(
+            x_pos - w / 2,
+            np.nan_to_num(tr_m),
+            w,
+            yerr=np.nan_to_num(tr_s),
+            capsize=3,
+            color='#4c72b0',
+            alpha=0.85,
+            label='Train',
+        )
+        ax.bar(
+            x_pos + w / 2,
+            np.nan_to_num(va_m),
+            w,
+            yerr=np.nan_to_num(va_s),
+            capsize=3,
+            color='#dd8452',
+            alpha=0.85,
+            label='Validation',
+        )
+        for i in range(len(names_stage)):
+            if np.isnan(tr_m[i]):
+                ax.text(
+                    x_pos[i],
+                    0.5 if metric == 'LogLoss' else 0.02,
+                    'n/a\n(no probabilities)',
+                    ha='center',
+                    va='bottom',
+                    fontsize=7.5,
+                    color='gray',
+                )
+        if metric == 'LogLoss':
+            ax.set_yscale('log')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([n.replace(' (', '\n(') for n in names_stage], fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8.5)
+        ax.set_title(
+            f'{stage}: {metric.replace("LogLoss", "Log-loss")} (mean ± std, 5 folds)',
+            fontsize=10,
+            fontweight='bold',
+        )
+        ax.legend(fontsize=8)
+
+fig_loss.suptitle('Train vs. Validation Loss: Baseline and Tuned Classifiers', fontsize=11.5, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'train_val_loss.png'), dpi=150, bbox_inches='tight')
+plt.show()
+
+
+def error_learning_curve(est):
+    sizes, tr_sc, va_sc = learning_curve(
+        est,
+        X_lbl,
+        y_lbl,
+        train_sizes=np.linspace(0.2, 1.0, 8),
+        cv=skf,
+        scoring='accuracy',
+        shuffle=True,
+        random_state=42,
+    )
+    return sizes, 1.0 - tr_sc, 1.0 - va_sc
+
+
+tuned_estimators = list(best_fitted_estimators.values())
+fig_lc, axes_lc = plt.subplots(2, 2, figsize=(12.6, 8.0), dpi=100, sharey=True)
+plt.subplots_adjust(hspace=0.32, wspace=0.12)
+for idx, (name, clf) in enumerate(tqdm(base_models.items(), desc='Learning curves', unit='model')):
+    ax = axes_lc.flat[idx]
+    for est, ls, tag in [(clf, '-', 'baseline'), (tuned_estimators[idx], '--', 'tuned regularized')]:
+        sizes, tr_err, va_err = error_learning_curve(clone(est))
+        for curve, color, lab in [(tr_err, '#4c72b0', 'train'), (va_err, '#dd8452', 'validation')]:
+            m, sd = curve.mean(1), curve.std(1)
+            ax.plot(sizes, m, ls, color=color, linewidth=2, marker='o', markersize=3.5, label=f'{lab} ({tag})')
+            ax.fill_between(sizes, m - sd, m + sd, color=color, alpha=0.12)
+    ax.set_title(name, fontsize=10, fontweight='bold')
+    ax.set_xlabel('Training set size (labeled pixels)', fontsize=8.5)
+    if idx % 2 == 0:
+        ax.set_ylabel('Error rate (1 - accuracy)', fontsize=8.5)
+    ax.legend(fontsize=7.2)
+
+fig_lc.suptitle('Learning Curves: Train vs. Validation Error (mean ± std, 5 folds)', fontsize=11.5, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'learning_curves.png'), dpi=150, bbox_inches='tight')
+plt.show()
 
 fig_cm_t, axes_cm_t = plt.subplots(2, 2, figsize=(11.8, 7.6), dpi=100)
 plt.subplots_adjust(hspace=0.38, wspace=0.22)
